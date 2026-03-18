@@ -13,6 +13,7 @@ static dispatch_queue_t global_audioQueue = nil;
 static AVCaptureVideoDataOutput *global_videoOutput = nil;
 static AVCaptureAudioDataOutput *global_audioOutput = nil;
 
+// [动态连线宏] 确保随时拿到最新连线，防止空指针黑屏
 #define DYNAMIC_VIDEO_CONN [global_videoOutput connectionWithMediaType:AVMediaTypeVideo]
 #define DYNAMIC_AUDIO_CONN [global_audioOutput connectionWithMediaType:AVMediaTypeAudio]
 
@@ -28,12 +29,10 @@ static BOOL isPlaying = NO;
 // ==========================================
 // 2. 哑巴替身 (Proxy Muting 核心防线)
 // ==========================================
-// 作用：接管真实硬件数据并扔进黑洞，防止 App 启用备用麦克风
 @interface LensVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @end
 @implementation LensVideoProxy
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
-    // 收到真实摄像头画面，直接丢弃，不传给 App！
 }
 @end
 
@@ -41,7 +40,6 @@ static BOOL isPlaying = NO;
 @end
 @implementation LensAudioProxy
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
-    // 收到真实麦克风声音，直接丢弃，不传给 App！
 }
 @end
 
@@ -92,7 +90,7 @@ static LensAudioProxy *g_audioProxy = nil;
     picker.delegate = self;
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.movie", @"public.video"]; 
-    picker.videoQuality = UIImagePickerControllerQualityTypeHigh; // 强制原画
+    picker.videoQuality = UIImagePickerControllerQualityTypeHigh; 
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
 
@@ -171,7 +169,6 @@ static void sendNextVirtualFrames() {
         CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &newVideoTiming, &newVideoBuffer);
         
         if (newVideoBuffer && global_videoDelegate && global_videoOutput) {
-            // 光学元数据注入
             CFMutableDictionaryRef cameraEXIF = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
             float fNumber = 1.5; int iso = 100; float exposure = 0.0;
             CFNumberRef fNumberRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &fNumber);
@@ -192,7 +189,7 @@ static void sendNextVirtualFrames() {
     }
     CFRelease(oldVideoBuffer);
     
-    // --- B. 音频追赶循环 (解决丢声断层) ---
+    // --- B. 音频追赶循环 ---
     while (global_audioTrackOutput) {
         CMSampleBufferRef oldAudioBuffer = [global_audioTrackOutput copyNextSampleBuffer];
         if (!oldAudioBuffer) break; 
@@ -210,9 +207,8 @@ static void sendNextVirtualFrames() {
         
         if (newAudioBuffer && global_audioDelegate && global_audioOutput) {
             CMSampleBufferRef bufferToPass = newAudioBuffer;
-            CFRetain(bufferToPass); // 保留引用防止被提前释放
+            CFRetain(bufferToPass); 
             
-            // [极其关键]：将音频精准推送到 App 要求的音频专线，绝不在视频线程投喂音频！
             if (global_audioQueue && global_audioQueue != global_videoQueue) {
                 dispatch_async(global_audioQueue, ^{
                     [global_audioDelegate captureOutput:global_audioOutput didOutputSampleBuffer:bufferToPass fromConnection:DYNAMIC_AUDIO_CONN];
@@ -248,11 +244,10 @@ static void startVirtualCameraLoop() {
     }
     
     if (audioTrack) {
-        // [音频防排异核心]：强制重采样为 44.1kHz + 单声道 + 16位PCM！拒绝静默丢弃！
         NSDictionary *audioSettings = @{
             AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @(44100.0),      // 极其关键：对齐 iPhone 麦克风标准采样率
-            AVNumberOfChannelsKey: @(1),      // 极其关键：对齐单声道
+            AVSampleRateKey: @(44100.0),      
+            AVNumberOfChannelsKey: @(1),      
             AVLinearPCMBitDepthKey: @(16),
             AVLinearPCMIsFloatKey: @NO,
             AVLinearPCMIsBigEndianKey: @NO,
@@ -292,7 +287,6 @@ static void startVirtualCameraLoop() {
         global_videoQueue = sampleBufferCallbackQueue;
         global_videoOutput = self; 
         
-        // 派出替身，完美堵住真实摄像头的嘴，且骗过 App 的底层检测
         if (!g_videoProxy) g_videoProxy = [[LensVideoProxy alloc] init];
         %orig(g_videoProxy, sampleBufferCallbackQueue);
     } else {
@@ -308,7 +302,6 @@ static void startVirtualCameraLoop() {
         global_audioQueue = sampleBufferCallbackQueue;
         global_audioOutput = self; 
         
-        // 派出替身，完美堵住真实麦克风的嘴，且骗过 App 的底层检测
         if (!g_audioProxy) g_audioProxy = [[LensAudioProxy alloc] init];
         %orig(g_audioProxy, sampleBufferCallbackQueue);
     } else {
@@ -320,13 +313,8 @@ static void startVirtualCameraLoop() {
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
-    for (AVCaptureOutput *output in self.outputs) {
-        if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
-            global_videoConnection = [output connectionWithMediaType:AVMediaTypeVideo];
-        } else if ([output isKindOfClass:[AVCaptureAudioDataOutput class]]) {
-            global_audioConnection = [output connectionWithMediaType:AVMediaTypeAudio];
-        }
-    }
+    
+    // [修复点]：已彻底移除会导致未知变量报错的废旧遍历代码
     
     global_timeOffset = kCMTimeInvalid;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
