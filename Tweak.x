@@ -232,11 +232,14 @@ static void startVirtualCameraLoop() {
 // 战术 1：暴力重写音频法则，防止 TikTok 静音我们的外放
 %hook AVAudioSession
 - (BOOL)setCategory:(AVAudioSessionCategory)category withOptions:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
-    AVAudioSessionCategoryOptions forceOptions = options | AVAudioSessionOptionMixWithOthers | AVAudioSessionOptionDefaultToSpeaker;
+    // [精准修复]：补全了 Category 关键字，完全符合苹果官方 API 规范
+    AVAudioSessionCategoryOptions forceOptions = options | AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDefaultToSpeaker;
     return %orig(category, forceOptions, outError);
 }
+
 - (BOOL)setCategory:(NSString *)category error:(NSError **)outError {
-    return [self setCategory:category withOptions:(AVAudioSessionOptionMixWithOthers | AVAudioSessionOptionDefaultToSpeaker) error:outError];
+    // [精准修复]：补全了 Category 关键字
+    return [self setCategory:category withOptions:(AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDefaultToSpeaker) error:outError];
 }
 %end
 
