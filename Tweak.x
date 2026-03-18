@@ -13,7 +13,7 @@ static dispatch_queue_t global_audioQueue = nil;
 static AVCaptureVideoDataOutput *global_videoOutput = nil;
 static AVCaptureAudioDataOutput *global_audioOutput = nil;
 
-// 动态获取真实连线，防止空指针
+// [动态连线宏] 确保随时拿到最新连线，防止空指针黑屏
 #define DYNAMIC_VIDEO_CONN [global_videoOutput connectionWithMediaType:AVMediaTypeVideo]
 #define DYNAMIC_AUDIO_CONN [global_audioOutput connectionWithMediaType:AVMediaTypeAudio]
 
@@ -62,7 +62,9 @@ static BOOL isPlaying = NO;
     if (!targetWindow) targetWindow = [[[UIApplication sharedApplication] windows] firstObject];
     
     UIViewController *topController = targetWindow.rootViewController;
-    while (topController.presentedViewController) topController = topController.presentedViewController; 
+    while (topController.presentedViewController) { 
+        topController = topController.presentedViewController; 
+    }
     return topController;
 }
 
@@ -71,6 +73,10 @@ static BOOL isPlaying = NO;
     picker.delegate = self;
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.movie", @"public.video"]; 
+    
+    // [画质修复核心]：强制要求相册不要压缩视频，保持最高清原画直出！
+    picker.videoQuality = UIImagePickerControllerQualityTypeHigh; 
+    
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
 
@@ -94,6 +100,7 @@ static BOOL isPlaying = NO;
         }
     }
 }
+
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
@@ -164,7 +171,7 @@ static void sendNextVirtualFrames() {
             CMSetAttachment(newVideoBuffer, CFSTR("MetadataDictionary"), cameraEXIF, kCMAttachmentMode_ShouldPropagate);
             CFRelease(fNumberRef); CFRelease(isoRef); CFRelease(exposureRef); CFRelease(cameraEXIF);
 
-            // 动态获取 Connection 投喂视频
+            // 动态连线投喂
             [global_videoDelegate captureOutput:global_videoOutput didOutputSampleBuffer:newVideoBuffer fromConnection:DYNAMIC_VIDEO_CONN];
             CFRelease(newVideoBuffer);
         }
@@ -189,7 +196,7 @@ static void sendNextVirtualFrames() {
         CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, oldAudioBuffer, 1, &newAudioTiming, &newAudioBuffer);
         
         if (newAudioBuffer && global_audioDelegate && global_audioOutput) {
-            // 动态获取 Connection 投喂音频
+            // 动态连线投喂
             [global_audioDelegate captureOutput:global_audioOutput didOutputSampleBuffer:newAudioBuffer fromConnection:DYNAMIC_AUDIO_CONN];
             CFRelease(newAudioBuffer);
         }
@@ -201,8 +208,10 @@ static void sendNextVirtualFrames() {
 
 static void startVirtualCameraLoop() {
     if (!dynamicVideoPath) return;
-    NSURL *videoURL = [NSURL fileURLWithPath:dynamicVideoPath];
-    AVURLAsset *asset = [AVURLAsset assetWithURL:videoURL];
+    
+    // [画质修复核心]：强制精确读取，拒绝丢帧
+    NSDictionary *options = @{ AVURLAssetPreferPreciseDurationAndTimingKey : @YES };
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:dynamicVideoPath] options:options];
     global_assetReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
     
     AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
@@ -214,7 +223,7 @@ static void startVirtualCameraLoop() {
     }
     
     if (audioTrack) {
-        // [极其关键的音频格式修复]：强制输出 16位整型、非浮点、交错的 PCM 数据，完美复刻 iPhone 麦克风硬件格式！
+        // [原声修复核心]：强制转换为 16 位整型、非浮点、交错的完美硬件麦克风格式！绝不被丢弃！
         NSDictionary *audioSettings = @{
             AVFormatIDKey: @(kAudioFormatLinearPCM),
             AVLinearPCMBitDepthKey: @(16),
