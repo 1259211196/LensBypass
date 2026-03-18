@@ -20,12 +20,12 @@ static dispatch_source_t global_frameTimer = nil;
 
 static NSString *dynamicVideoPath = nil; 
 
-// [终极优化 1]：增加全局时间差锚点，用于完美平移时间轴，保证音画 100% 同步
+// 增加全局时间差锚点，用于完美平移时间轴，保证音画 100% 同步
 static CMTime global_timeOffset = {0, 0, 0, 0}; 
 static BOOL isPlaying = NO;
 
 // ==========================================
-// 2. 悬浮窗与相册控制器 (保持不变)
+// 2. 悬浮窗与相册控制器
 // ==========================================
 @interface LensBypassUIManager : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) UIButton *floatingButton;
@@ -96,13 +96,11 @@ static BOOL isPlaying = NO;
 @end
 
 // ==========================================
-// 3. 底层控制与重构模块 (终极进化版)
+// 3. 底层控制与重构模块
 // ==========================================
 
-// 提前声明循环播放函数
 static void startVirtualCameraLoop(void);
 
-// 资源清理小助手
 static void cleanupAssetReader() {
     if (global_assetReader) {
         [global_assetReader cancelReading];
@@ -121,28 +119,23 @@ static void sendNextVirtualFrames() {
         oldVideoBuffer = [global_videoTrackOutput copyNextSampleBuffer];
     }
     
-    // [终极优化 2]：视频播完检测与无缝循环 (EOF Check & Loop)
+    // 视频播完检测与无缝循环
     if (!oldVideoBuffer) {
         cleanupAssetReader();
-        // 循环时必须废弃旧的锚点，让下一轮重新对齐当前时间
         global_timeOffset = kCMTimeInvalid; 
         startVirtualCameraLoop();
         return; 
     }
     
-    // 获取原视频的旧时间戳
     CMTime originalVideoPTS = CMSampleBufferGetPresentationTimeStamp(oldVideoBuffer);
     
-    // 如果是第一帧，计算并锁定时间差锚点 (当前真实系统时间 - 视频原本的旧时间)
     if (CMTIME_IS_INVALID(global_timeOffset)) {
         CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
         global_timeOffset = CMTimeSubtract(now, originalVideoPTS);
     }
     
-    // 【核心平移算法】：新时间 = 旧时间 + 锚点差值。完美保留了微秒级的帧间距！
     CMTime newVideoPTS = CMTimeAdd(originalVideoPTS, global_timeOffset);
     
-    // 重建视频帧
     CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(oldVideoBuffer);
     if (pixelBuffer) {
         CMSampleTimingInfo newVideoTiming;
@@ -157,6 +150,31 @@ static void sendNextVirtualFrames() {
         CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &newVideoTiming, &newVideoBuffer);
         
         if (newVideoBuffer && global_videoDelegate) {
+            
+            // 【核心补全】：注入物理光学元数据 (EXIF)，赋予视频帧真实摄像头的“灵魂”
+            CFMutableDictionaryRef cameraEXIF = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            float fNumber = 1.5;
+            int iso = 100;
+            float exposure = 0.0;
+            
+            CFNumberRef fNumberRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &fNumber);
+            CFNumberRef isoRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &iso);
+            CFNumberRef exposureRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &exposure);
+            
+            CFDictionarySetValue(cameraEXIF, CFSTR("FNumber"), fNumberRef);
+            CFDictionarySetValue(cameraEXIF, CFSTR("ISOSpeedRatings"), isoRef);
+            CFDictionarySetValue(cameraEXIF, CFSTR("ExposureBiasValue"), exposureRef);
+            
+            // 绑定到当前帧
+            CMSetAttachment(newVideoBuffer, CFSTR("MetadataDictionary"), cameraEXIF, kCMAttachmentMode_ShouldPropagate);
+            
+            // 内存闭环释放
+            CFRelease(fNumberRef);
+            CFRelease(isoRef);
+            CFRelease(exposureRef);
+            CFRelease(cameraEXIF);
+
+            // 投喂带有真实连接与光学指纹的完美帧
             [global_videoDelegate captureOutput:nil didOutputSampleBuffer:newVideoBuffer fromConnection:global_videoConnection];
             CFRelease(newVideoBuffer);
         }
@@ -164,11 +182,10 @@ static void sendNextVirtualFrames() {
     }
     CFRelease(oldVideoBuffer);
     
-    // --- B. 音频追赶循环 (解决 Audio Pump Bug) ---
-    // [终极优化 3]：音频不再盲目投喂。它会连续抽取，直到它的新时间戳“追平”刚刚投喂的视频时间戳
+    // --- B. 音频追赶循环 ---
     while (global_audioTrackOutput) {
         CMSampleBufferRef oldAudioBuffer = [global_audioTrackOutput copyNextSampleBuffer];
-        if (!oldAudioBuffer) break; // 音频轨读完
+        if (!oldAudioBuffer) break; 
         
         CMTime originalAudioPTS = CMSampleBufferGetPresentationTimeStamp(oldAudioBuffer);
         CMTime newAudioPTS = CMTimeAdd(originalAudioPTS, global_timeOffset);
@@ -187,7 +204,6 @@ static void sendNextVirtualFrames() {
         }
         CFRelease(oldAudioBuffer);
         
-        // 如果这帧音频的时间已经赶上了视频时间，跳出循环，等待下一次定时器
         if (CMTimeCompare(newAudioPTS, newVideoPTS) >= 0) {
             break;
         }
@@ -205,7 +221,6 @@ static void startVirtualCameraLoop() {
     AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
     
     if (videoTrack) {
-        // [终极优化 4]：强制输出为 NV12，这是 iOS AVFoundation 最底层最安全的色彩格式，极大降低了因格式不对导致的崩溃
         global_videoTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
         [global_assetReader addOutput:global_videoTrackOutput];
     }
@@ -218,12 +233,10 @@ static void startVirtualCameraLoop() {
     [global_assetReader startReading];
     isPlaying = YES;
     
-    // [终极优化 5]：动态帧率自适应。不再写死 30fps。原视频是多少帧，我们就设多快的定时器！
     float nominalFPS = (videoTrack && videoTrack.nominalFrameRate > 0) ? videoTrack.nominalFrameRate : 30.0;
     
     if (global_videoQueue && !global_frameTimer) {
         global_frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, global_videoQueue);
-        // 按视频真实帧率触发
         dispatch_source_set_timer(global_frameTimer, dispatch_walltime(NULL, 0), (1.0 / nominalFPS) * NSEC_PER_SEC, 0);
         dispatch_source_set_event_handler(global_frameTimer, ^{ 
             if(isPlaying) { sendNextVirtualFrames(); }
@@ -267,11 +280,24 @@ static void startVirtualCameraLoop() {
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
-    global_timeOffset = kCMTimeInvalid; // 每次开机重置时间锚点
+    
+    // 获取真实设备的通信管道
+    for (AVCaptureOutput *output in self.outputs) {
+        if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+            global_videoConnection = [output connectionWithMediaType:AVMediaTypeVideo];
+            NSLog(@"[LensBypass] 成功窃取真实视频 Connection: %@", global_videoConnection);
+        } else if ([output isKindOfClass:[AVCaptureAudioDataOutput class]]) {
+            global_audioConnection = [output connectionWithMediaType:AVMediaTypeAudio];
+            NSLog(@"[LensBypass] 成功窃取真实音频 Connection: %@", global_audioConnection);
+        }
+    }
+    
+    global_timeOffset = kCMTimeInvalid;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         startVirtualCameraLoop();
     });
 }
+
 - (void)stopRunning {
     %orig;
     isPlaying = NO;
