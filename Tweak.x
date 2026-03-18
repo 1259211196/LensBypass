@@ -3,41 +3,25 @@
 #import <CoreMedia/CoreMedia.h>
 
 // ==========================================
-// 1. 全局核心指针与状态池
+// 1. 全局通信指针与状态 (纯净视频版)
 // ==========================================
 static id<AVCaptureVideoDataOutputSampleBufferDelegate> global_videoDelegate = nil;
 static dispatch_queue_t global_videoQueue = nil;
 static AVCaptureVideoDataOutput *global_videoOutput = nil;
 
-// 动态获取真实视频通道
+// [动态连线宏] 确保随时拿到最新视频连线
 #define DYNAMIC_VIDEO_CONN [global_videoOutput connectionWithMediaType:AVMediaTypeVideo]
 
 static AVAssetReader *global_assetReader = nil;
 static AVAssetReaderTrackOutput *global_videoTrackOutput = nil;
 static dispatch_source_t global_frameTimer = nil;
 
-// 物理声学回环引擎
-static AVAudioPlayer *global_audioPlayer = nil;
-
 static NSString *dynamicVideoPath = nil; 
 static CMTime global_timeOffset = {0, 0, 0, 0}; 
 static BOOL isPlaying = NO;
 
 // ==========================================
-// 2. 视频哑巴替身 (代理黑洞)
-// ==========================================
-@interface LensVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-@end
-@implementation LensVideoProxy
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
-    // 真实摄像头数据流入此黑洞，彻底销毁
-}
-@end
-
-static LensVideoProxy *g_videoProxy = nil;
-
-// ==========================================
-// 3. 潜行控制面板 (双指三击触发)
+// 2. 潜行模式：隐形手势与相册控制器
 // ==========================================
 @interface LensBypassUIManager : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 + (instancetype)sharedInstance;
@@ -56,12 +40,13 @@ static LensVideoProxy *g_videoProxy = nil;
     for (UIGestureRecognizer *gesture in window.gestureRecognizers) {
         if ([gesture.accessibilityLabel isEqualToString:@"LensBypassGesture"]) return; 
     }
-    // 隐形暗号：双指同时点击屏幕三次
+    // 暗号：双指三击屏幕任意位置唤出相册
     UITapGestureRecognizer *secretTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openAlbum)];
     secretTap.numberOfTouchesRequired = 2; 
     secretTap.numberOfTapsRequired = 3;    
     secretTap.accessibilityLabel = @"LensBypassGesture"; 
     [window addGestureRecognizer:secretTap];
+    NSLog(@"[LensBypass] 隐形手势注入成功，暗号：双指三击");
 }
 
 - (UIViewController *)topViewController {
@@ -72,7 +57,9 @@ static LensVideoProxy *g_videoProxy = nil;
     if (!targetWindow) targetWindow = [[[UIApplication sharedApplication] windows] firstObject];
     
     UIViewController *topController = targetWindow.rootViewController;
-    while (topController.presentedViewController) { topController = topController.presentedViewController; }
+    while (topController.presentedViewController) { 
+        topController = topController.presentedViewController; 
+    }
     return topController;
 }
 
@@ -81,7 +68,10 @@ static LensVideoProxy *g_videoProxy = nil;
     picker.delegate = self;
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.movie", @"public.video"]; 
-    picker.videoQuality = UIImagePickerControllerQualityTypeHigh; // 强制系统不压缩画质
+    
+    // 强制系统不压缩画质，保持原画直出
+    picker.videoQuality = UIImagePickerControllerQualityTypeHigh; 
+    
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
 
@@ -100,20 +90,23 @@ static LensVideoProxy *g_videoProxy = nil;
             dynamicVideoPath = destPath;
             global_timeOffset = kCMTimeInvalid;
             isPlaying = NO;
-            // 选片成功后，震动反馈确认弹药上膛
-            UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+            // 选片成功，手机震动反馈
+            UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
             [feedback impactOccurred];
+            NSLog(@"[LensBypass] 视频已就绪，潜行等待中...");
         }
     }
 }
+
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
 @end
 
 // ==========================================
-// 4. 底层投喂与岁月史书引擎
+// 3. 底层视频投喂模块 (纯视频)
 // ==========================================
+
 static void startVirtualCameraLoop(void);
 
 static void cleanupAssetReader() {
@@ -122,19 +115,16 @@ static void cleanupAssetReader() {
         global_assetReader = nil;
         global_videoTrackOutput = nil;
     }
-    if (global_audioPlayer) {
-        [global_audioPlayer stop];
-        global_audioPlayer = nil;
-    }
 }
 
 static void sendNextVirtualFrames() {
     if (!global_assetReader || global_assetReader.status != AVAssetReaderStatusReading) return;
     
+    // --- 视频抽帧与锚点重铸 ---
     CMSampleBufferRef oldVideoBuffer = NULL;
     if (global_videoTrackOutput) oldVideoBuffer = [global_videoTrackOutput copyNextSampleBuffer];
     
-    // 循环点：播完后瞬间重置时间锚点与播放器
+    // 视频播完，触发循环并废弃旧时间锚点
     if (!oldVideoBuffer) {
         cleanupAssetReader();
         global_timeOffset = kCMTimeInvalid; 
@@ -144,7 +134,6 @@ static void sendNextVirtualFrames() {
     
     CMTime originalVideoPTS = CMSampleBufferGetPresentationTimeStamp(oldVideoBuffer);
     
-    // 核心：相对时间锚点锁定
     if (CMTIME_IS_INVALID(global_timeOffset)) {
         CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
         global_timeOffset = CMTimeSubtract(now, originalVideoPTS);
@@ -166,9 +155,9 @@ static void sendNextVirtualFrames() {
         CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &newVideoTiming, &newVideoBuffer);
         
         if (newVideoBuffer && global_videoDelegate && global_videoOutput) {
-            // 核心：光学物理元数据注入，骗过 CV 纯净度检测
+            // [极其重要的光学元数据注入] 骗过系统判定，赋予真实灵魂
             CFMutableDictionaryRef cameraEXIF = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            float fNumber = 1.8; int iso = 125; float exposure = 0.0;
+            float fNumber = 1.5; int iso = 100; float exposure = 0.0;
             CFNumberRef fNumberRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &fNumber);
             CFNumberRef isoRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &iso);
             CFNumberRef exposureRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &exposure);
@@ -180,6 +169,7 @@ static void sendNextVirtualFrames() {
             CMSetAttachment(newVideoBuffer, CFSTR("MetadataDictionary"), cameraEXIF, kCMAttachmentMode_ShouldPropagate);
             CFRelease(fNumberRef); CFRelease(isoRef); CFRelease(exposureRef); CFRelease(cameraEXIF);
 
+            // 动态连线投喂
             [global_videoDelegate captureOutput:global_videoOutput didOutputSampleBuffer:newVideoBuffer fromConnection:DYNAMIC_VIDEO_CONN];
             CFRelease(newVideoBuffer);
         }
@@ -191,23 +181,15 @@ static void sendNextVirtualFrames() {
 static void startVirtualCameraLoop() {
     if (!dynamicVideoPath) return;
     
-    NSURL *videoURL = [NSURL fileURLWithPath:dynamicVideoPath];
-    
-    // --- 启动声学回环外放 ---
-    NSError *audioError = nil;
-    global_audioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:videoURL error:&audioError];
-    if (global_audioPlayer) {
-        [global_audioPlayer setVolume:1.0];
-        [global_audioPlayer prepareToPlay];
-        [global_audioPlayer play];
-    }
-    
+    // 强制精确读取时间轴
     NSDictionary *options = @{ AVURLAssetPreferPreciseDurationAndTimingKey : @YES };
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:videoURL options:options];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:dynamicVideoPath] options:options];
     global_assetReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
     
     AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    
     if (videoTrack) {
+        // 强制转换为最安全的底层色彩格式 NV12
         global_videoTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
         [global_assetReader addOutput:global_videoTrackOutput];
     }
@@ -226,24 +208,9 @@ static void startVirtualCameraLoop() {
 }
 
 // ==========================================
-// 5. 最高权限 API 拦截网
+// 4. API 拦截网
 // ==========================================
 
-// 战术 1：暴力重写音频法则，防止 TikTok 静音我们的外放
-%hook AVAudioSession
-- (BOOL)setCategory:(AVAudioSessionCategory)category withOptions:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
-    // [精准修复]：补全了 Category 关键字，完全符合苹果官方 API 规范
-    AVAudioSessionCategoryOptions forceOptions = options | AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDefaultToSpeaker;
-    return %orig(category, forceOptions, outError);
-}
-
-- (BOOL)setCategory:(NSString *)category error:(NSError **)outError {
-    // [精准修复]：补全了 Category 关键字
-    return [self setCategory:category withOptions:(AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDefaultToSpeaker) error:outError];
-}
-%end
-
-// 战术 2：手势注入
 %hook UIWindow
 - (void)makeKeyAndVisible {
     %orig;
@@ -251,23 +218,21 @@ static void startVirtualCameraLoop() {
 }
 %end
 
-// 战术 3：拦截视频流，扔进黑洞
+// [保留]：劫持视频通道，阻止真实镜头数据流入 App
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)sampleBufferCallbackQueue {
     if (sampleBufferDelegate) {
         global_videoDelegate = sampleBufferDelegate;
         global_videoQueue = sampleBufferCallbackQueue;
         global_videoOutput = self; 
-        
-        if (!g_videoProxy) g_videoProxy = [[LensVideoProxy alloc] init];
-        %orig(g_videoProxy, sampleBufferCallbackQueue);
-    } else {
-        %orig;
     }
+    %orig(nil, nil); 
 }
 %end
 
-// 战术 4：监听相机启动信号，开始投喂
+// [重要]：我们完全删除了对 AVCaptureAudioDataOutput 的 hook！
+// 这意味着宿主 App (TikTok) 现在会完完全全、正正常常地去连接并使用手机底部的物理麦克风。
+
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
@@ -276,6 +241,7 @@ static void startVirtualCameraLoop() {
         startVirtualCameraLoop();
     });
 }
+
 - (void)stopRunning {
     %orig;
     isPlaying = NO;
