@@ -18,13 +18,15 @@ static AVAssetReaderTrackOutput *global_videoTrackOutput = nil;
 static AVAssetReaderTrackOutput *global_audioTrackOutput = nil;
 static dispatch_source_t global_frameTimer = nil;
 
-// 动态存储相册选取的视频路径
 static NSString *dynamicVideoPath = nil; 
 
+// [终极优化 1]：增加全局时间差锚点，用于完美平移时间轴，保证音画 100% 同步
+static CMTime global_timeOffset = {0, 0, 0, 0}; 
+static BOOL isPlaying = NO;
+
 // ==========================================
-// 2. 悬浮窗与相册控制器 (UI交互层)
+// 2. 悬浮窗与相册控制器 (保持不变)
 // ==========================================
-// 使用常规的 Objective-C 语法在 Theos 中声明一个控制器来处理相册代理
 @interface LensBypassUIManager : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) UIButton *floatingButton;
 + (instancetype)sharedInstance;
@@ -32,166 +34,178 @@ static NSString *dynamicVideoPath = nil;
 @end
 
 @implementation LensBypassUIManager
-
 + (instancetype)sharedInstance {
     static LensBypassUIManager *instance = nil;
     static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[self alloc] init];
-    });
+    dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
     return instance;
 }
-
 - (void)setupFloatingButtonInWindow:(UIWindow *)window {
     if (self.floatingButton) return;
-    
     self.floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingButton.frame = CGRectMake(20, 100, 60, 60);
     self.floatingButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
     self.floatingButton.layer.cornerRadius = 30;
     [self.floatingButton setTitle:@"选片" forState:UIControlStateNormal];
     [self.floatingButton addTarget:self action:@selector(openAlbum) forControlEvents:UIControlEventTouchUpInside];
-    
-    // 添加拖拽手势
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self.floatingButton addGestureRecognizer:pan];
-    
     [window addSubview:self.floatingButton];
-    NSLog(@"[LensBypass] 悬浮控制台注入成功");
 }
-
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     CGPoint point = [pan translationInView:self.floatingButton.superview];
     self.floatingButton.center = CGPointMake(self.floatingButton.center.x + point.x, self.floatingButton.center.y + point.y);
     [pan setTranslation:CGPointZero inView:self.floatingButton.superview];
 }
-
-// 寻找当前顶层视图控制器以弹出相册
 - (UIViewController *)topViewController {
     UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (topController.presentedViewController) {
-        topController = topController.presentedViewController;
-    }
+    while (topController.presentedViewController) { topController = topController.presentedViewController; }
     return topController;
 }
-
 - (void)openAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.delegate = self;
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    // 限制只能选视频
-    picker.mediaTypes = @[(NSString *)kUTTypeMovie, (NSString *)kUTTypeVideo, (NSString *)kUTTypeMPEG4]; 
-    picker.videoExportPreset = AVAssetExportPresetHighestQuality;
-    
+    picker.mediaTypes = @[(NSString *)kUTTypeMovie, (NSString *)kUTTypeVideo]; 
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
-
-// 相册选取完成回调
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    
     NSURL *videoURL = info[UIImagePickerControllerMediaURL];
     if (videoURL) {
-        // [极度关键]：系统相册返回的是 tmp 目录下的临时文件，App 随时会清理。
-        // 我们必须把它拷贝到 Documents 目录下固化下来。
         NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSString *destPath = [docPath stringByAppendingPathComponent:@"lensbypass_target.mp4"];
-        
         NSError *error = nil;
         NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:destPath]) {
-            [fm removeItemAtPath:destPath error:nil]; // 删掉旧的
-        }
+        if ([fm fileExistsAtPath:destPath]) { [fm removeItemAtPath:destPath error:nil]; }
         [fm copyItemAtPath:videoURL.path toPath:destPath error:&error];
-        
         if (!error) {
             dynamicVideoPath = destPath;
             [self.floatingButton setTitle:@"已载" forState:UIControlStateNormal];
             self.floatingButton.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.7];
-            NSLog(@"[LensBypass] 视频已就绪，路径: %@", dynamicVideoPath);
-        } else {
-            NSLog(@"[LensBypass] 视频拷贝失败: %@", error);
+            
+            // 如果更换了视频，强制重置状态
+            global_timeOffset = kCMTimeInvalid;
+            isPlaying = NO;
         }
     }
 }
-
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
-
 @end
 
+// ==========================================
+// 3. 底层控制与重构模块 (终极进化版)
+// ==========================================
 
-// ==========================================
-// 3. 底层投喂核心：音视频双轨同步与时间重铸
-// ==========================================
+// 提前声明循环播放函数
+static void startVirtualCameraLoop(void);
+
+// 资源清理小助手
+static void cleanupAssetReader() {
+    if (global_assetReader) {
+        [global_assetReader cancelReading];
+        global_assetReader = nil;
+        global_videoTrackOutput = nil;
+        global_audioTrackOutput = nil;
+    }
+}
 
 static void sendNextVirtualFrames() {
     if (!global_assetReader || global_assetReader.status != AVAssetReaderStatusReading) return;
     
-    // 获取当前绝对系统时间，实现彻底的“岁月史书”
-    CMTime currentSystemTime = CMClockGetTime(CMClockGetHostTimeClock());
-    
-    // --- 视频流处理 ---
+    // --- A. 视频抽帧与锚点重铸 ---
+    CMSampleBufferRef oldVideoBuffer = NULL;
     if (global_videoTrackOutput) {
-        CMSampleBufferRef oldVideoBuffer = [global_videoTrackOutput copyNextSampleBuffer];
-        if (oldVideoBuffer) {
-            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(oldVideoBuffer);
-            if (pixelBuffer) {
-                CMSampleTimingInfo newVideoTiming;
-                newVideoTiming.presentationTimeStamp = currentSystemTime;
-                newVideoTiming.decodeTimeStamp = kCMTimeInvalid;
-                newVideoTiming.duration = CMSampleBufferGetDuration(oldVideoBuffer);
-                
-                CMVideoFormatDescriptionRef formatDesc = NULL;
-                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
-                
-                CMSampleBufferRef newVideoBuffer = NULL;
-                CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &newVideoTiming, &newVideoBuffer);
-                
-                if (newVideoBuffer && global_videoDelegate) {
-                    [global_videoDelegate captureOutput:nil didOutputSampleBuffer:newVideoBuffer fromConnection:global_videoConnection];
-                    CFRelease(newVideoBuffer);
-                }
-                if (formatDesc) CFRelease(formatDesc);
-            }
-            CFRelease(oldVideoBuffer);
-        } else {
-            // 这里可以处理视频循环播放逻辑
-        }
+        oldVideoBuffer = [global_videoTrackOutput copyNextSampleBuffer];
     }
     
-    // --- 音频流处理 ---
-    if (global_audioTrackOutput) {
+    // [终极优化 2]：视频播完检测与无缝循环 (EOF Check & Loop)
+    if (!oldVideoBuffer) {
+        cleanupAssetReader();
+        // 循环时必须废弃旧的锚点，让下一轮重新对齐当前时间
+        global_timeOffset = kCMTimeInvalid; 
+        startVirtualCameraLoop();
+        return; 
+    }
+    
+    // 获取原视频的旧时间戳
+    CMTime originalVideoPTS = CMSampleBufferGetPresentationTimeStamp(oldVideoBuffer);
+    
+    // 如果是第一帧，计算并锁定时间差锚点 (当前真实系统时间 - 视频原本的旧时间)
+    if (CMTIME_IS_INVALID(global_timeOffset)) {
+        CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
+        global_timeOffset = CMTimeSubtract(now, originalVideoPTS);
+    }
+    
+    // 【核心平移算法】：新时间 = 旧时间 + 锚点差值。完美保留了微秒级的帧间距！
+    CMTime newVideoPTS = CMTimeAdd(originalVideoPTS, global_timeOffset);
+    
+    // 重建视频帧
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(oldVideoBuffer);
+    if (pixelBuffer) {
+        CMSampleTimingInfo newVideoTiming;
+        newVideoTiming.presentationTimeStamp = newVideoPTS;
+        newVideoTiming.decodeTimeStamp = kCMTimeInvalid;
+        newVideoTiming.duration = CMSampleBufferGetDuration(oldVideoBuffer);
+        
+        CMVideoFormatDescriptionRef formatDesc = NULL;
+        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
+        
+        CMSampleBufferRef newVideoBuffer = NULL;
+        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &newVideoTiming, &newVideoBuffer);
+        
+        if (newVideoBuffer && global_videoDelegate) {
+            [global_videoDelegate captureOutput:nil didOutputSampleBuffer:newVideoBuffer fromConnection:global_videoConnection];
+            CFRelease(newVideoBuffer);
+        }
+        if (formatDesc) CFRelease(formatDesc);
+    }
+    CFRelease(oldVideoBuffer);
+    
+    // --- B. 音频追赶循环 (解决 Audio Pump Bug) ---
+    // [终极优化 3]：音频不再盲目投喂。它会连续抽取，直到它的新时间戳“追平”刚刚投喂的视频时间戳
+    while (global_audioTrackOutput) {
         CMSampleBufferRef oldAudioBuffer = [global_audioTrackOutput copyNextSampleBuffer];
-        if (oldAudioBuffer) {
-            CMSampleTimingInfo newAudioTiming;
-            newAudioTiming.presentationTimeStamp = currentSystemTime;
-            newAudioTiming.decodeTimeStamp = kCMTimeInvalid;
-            newAudioTiming.duration = CMSampleBufferGetDuration(oldAudioBuffer);
-            
-            CMSampleBufferRef newAudioBuffer = NULL;
-            CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, oldAudioBuffer, 1, &newAudioTiming, &newAudioBuffer);
-            
-            if (newAudioBuffer && global_audioDelegate) {
-                [global_audioDelegate captureOutput:nil didOutputSampleBuffer:newAudioBuffer fromConnection:global_audioConnection];
-                CFRelease(newAudioBuffer);
-            }
-            CFRelease(oldAudioBuffer);
+        if (!oldAudioBuffer) break; // 音频轨读完
+        
+        CMTime originalAudioPTS = CMSampleBufferGetPresentationTimeStamp(oldAudioBuffer);
+        CMTime newAudioPTS = CMTimeAdd(originalAudioPTS, global_timeOffset);
+        
+        CMSampleTimingInfo newAudioTiming;
+        newAudioTiming.presentationTimeStamp = newAudioPTS;
+        newAudioTiming.decodeTimeStamp = kCMTimeInvalid;
+        newAudioTiming.duration = CMSampleBufferGetDuration(oldAudioBuffer);
+        
+        CMSampleBufferRef newAudioBuffer = NULL;
+        CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, oldAudioBuffer, 1, &newAudioTiming, &newAudioBuffer);
+        
+        if (newAudioBuffer && global_audioDelegate) {
+            [global_audioDelegate captureOutput:nil didOutputSampleBuffer:newAudioBuffer fromConnection:global_audioConnection];
+            CFRelease(newAudioBuffer);
+        }
+        CFRelease(oldAudioBuffer);
+        
+        // 如果这帧音频的时间已经赶上了视频时间，跳出循环，等待下一次定时器
+        if (CMTimeCompare(newAudioPTS, newVideoPTS) >= 0) {
+            break;
         }
     }
 }
 
 static void startVirtualCameraLoop() {
-    if (!dynamicVideoPath || global_frameTimer) return; // 如果还没选视频，就不启动
+    if (!dynamicVideoPath) return;
     
     NSURL *videoURL = [NSURL fileURLWithPath:dynamicVideoPath];
-    global_assetReader = [AVAssetReader assetReaderWithAsset:[AVURLAsset assetWithURL:videoURL] error:nil];
+    AVURLAsset *asset = [AVURLAsset assetWithURL:videoURL];
+    global_assetReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
     
-    AVAssetTrack *videoTrack = [[[AVURLAsset assetWithURL:videoURL] tracksWithMediaType:AVMediaTypeVideo] firstObject];
-    AVAssetTrack *audioTrack = [[[AVURLAsset assetWithURL:videoURL] tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
     
     if (videoTrack) {
+        // [终极优化 4]：强制输出为 NV12，这是 iOS AVFoundation 最底层最安全的色彩格式，极大降低了因格式不对导致的崩溃
         global_videoTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
         [global_assetReader addOutput:global_videoTrackOutput];
     }
@@ -202,12 +216,17 @@ static void startVirtualCameraLoop() {
     }
     
     [global_assetReader startReading];
+    isPlaying = YES;
     
-    if (global_videoQueue) {
+    // [终极优化 5]：动态帧率自适应。不再写死 30fps。原视频是多少帧，我们就设多快的定时器！
+    float nominalFPS = (videoTrack && videoTrack.nominalFrameRate > 0) ? videoTrack.nominalFrameRate : 30.0;
+    
+    if (global_videoQueue && !global_frameTimer) {
         global_frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, global_videoQueue);
-        dispatch_source_set_timer(global_frameTimer, dispatch_walltime(NULL, 0), (1.0 / 30.0) * NSEC_PER_SEC, 0);
-        dispatch_source_set_event_handler(global_frameTimer, ^{
-            sendNextVirtualFrames();
+        // 按视频真实帧率触发
+        dispatch_source_set_timer(global_frameTimer, dispatch_walltime(NULL, 0), (1.0 / nominalFPS) * NSEC_PER_SEC, 0);
+        dispatch_source_set_event_handler(global_frameTimer, ^{ 
+            if(isPlaying) { sendNextVirtualFrames(); }
         });
         dispatch_resume(global_frameTimer);
     }
@@ -219,13 +238,11 @@ static void startVirtualCameraLoop() {
 // ==========================================
 
 %hook UIWindow
-// 拦截 Window 显示，注入悬浮按钮
 - (void)makeKeyAndVisible {
     %orig;
     [[LensBypassUIManager sharedInstance] setupFloatingButtonInWindow:self];
 }
 %end
-
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)sampleBufferCallbackQueue {
@@ -233,10 +250,9 @@ static void startVirtualCameraLoop() {
         global_videoDelegate = sampleBufferDelegate;
         global_videoQueue = sampleBufferCallbackQueue;
     }
-    %orig(nil, nil); // 屏蔽真实相机
+    %orig(nil, nil); // 切断真实镜头
 }
 %end
-
 
 %hook AVCaptureAudioDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureAudioDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)sampleBufferCallbackQueue {
@@ -244,28 +260,22 @@ static void startVirtualCameraLoop() {
         global_audioDelegate = sampleBufferDelegate;
         global_audioQueue = sampleBufferCallbackQueue;
     }
-    %orig(nil, nil); // 屏蔽真实麦克风
+    %orig(nil, nil); // 切断真实麦克风
 }
 %end
-
 
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
+    global_timeOffset = kCMTimeInvalid; // 每次开机重置时间锚点
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         startVirtualCameraLoop();
     });
 }
-
 - (void)stopRunning {
     %orig;
-    if (global_frameTimer) {
-        dispatch_source_cancel(global_frameTimer);
-        global_frameTimer = nil;
-    }
-    if (global_assetReader) {
-        [global_assetReader cancelReading];
-        global_assetReader = nil;
-    }
+    isPlaying = NO;
+    if (global_frameTimer) { dispatch_source_cancel(global_frameTimer); global_frameTimer = nil; }
+    cleanupAssetReader();
 }
 %end
