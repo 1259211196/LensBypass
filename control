@@ -1,0 +1,9 @@
+Package: com.yourname.lensbypass
+Name: LensBypass
+Depends: mobilesubstrate
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 虚拟摄像头注入核心 (TrollStore Edition)
+Maintainer: YourName
+Author: YourName
+Section: Tweaks
