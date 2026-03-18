@@ -9,12 +9,13 @@ static id<AVCaptureVideoDataOutputSampleBufferDelegate> global_videoDelegate = n
 static id<AVCaptureAudioDataOutputSampleBufferDelegate> global_audioDelegate = nil;
 static dispatch_queue_t global_videoQueue = nil;
 static dispatch_queue_t global_audioQueue = nil;
-static AVCaptureConnection *global_videoConnection = nil;
-static AVCaptureConnection *global_audioConnection = nil;
 
-// [核心修复]：新增全局 Output 对象指针，用于向代理完美汇报数据来源
 static AVCaptureVideoDataOutput *global_videoOutput = nil;
 static AVCaptureAudioDataOutput *global_audioOutput = nil;
+
+// 动态获取真实连线，防止空指针
+#define DYNAMIC_VIDEO_CONN [global_videoOutput connectionWithMediaType:AVMediaTypeVideo]
+#define DYNAMIC_AUDIO_CONN [global_audioOutput connectionWithMediaType:AVMediaTypeAudio]
 
 static AVAssetReader *global_assetReader = nil;
 static AVAssetReaderTrackOutput *global_videoTrackOutput = nil;
@@ -54,22 +55,14 @@ static BOOL isPlaying = NO;
 }
 
 - (UIViewController *)topViewController {
-    // [核心修复]：绕过 keyWindow 废弃错误，动态遍历寻找主窗口
     UIWindow *targetWindow = nil;
     for (UIWindow *window in [[UIApplication sharedApplication] windows]) {
-        if (window.isKeyWindow) {
-            targetWindow = window;
-            break;
-        }
+        if (window.isKeyWindow) { targetWindow = window; break; }
     }
-    if (!targetWindow) {
-        targetWindow = [[[UIApplication sharedApplication] windows] firstObject];
-    }
+    if (!targetWindow) targetWindow = [[[UIApplication sharedApplication] windows] firstObject];
     
     UIViewController *topController = targetWindow.rootViewController;
-    while (topController.presentedViewController) { 
-        topController = topController.presentedViewController; 
-    }
+    while (topController.presentedViewController) topController = topController.presentedViewController; 
     return topController;
 }
 
@@ -77,7 +70,6 @@ static BOOL isPlaying = NO;
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.delegate = self;
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    // [核心修复]：使用底层硬编码字符串代替废弃的宏，彻底切断对 MobileCoreServices 的依赖
     picker.mediaTypes = @[@"public.movie", @"public.video"]; 
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
@@ -96,14 +88,12 @@ static BOOL isPlaying = NO;
             dynamicVideoPath = destPath;
             global_timeOffset = kCMTimeInvalid;
             isPlaying = NO;
-            // 静默震动反馈，提示加载成功！
             UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
             [feedback impactOccurred];
             NSLog(@"[LensBypass] 视频已就绪，潜行等待中...");
         }
     }
 }
-
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
@@ -172,11 +162,10 @@ static void sendNextVirtualFrames() {
             CFDictionarySetValue(cameraEXIF, CFSTR("ExposureBiasValue"), exposureRef);
             
             CMSetAttachment(newVideoBuffer, CFSTR("MetadataDictionary"), cameraEXIF, kCMAttachmentMode_ShouldPropagate);
-            
             CFRelease(fNumberRef); CFRelease(isoRef); CFRelease(exposureRef); CFRelease(cameraEXIF);
 
-            // [核心修复]：传入真实的 global_videoOutput，完美欺骗非空校验
-            [global_videoDelegate captureOutput:global_videoOutput didOutputSampleBuffer:newVideoBuffer fromConnection:global_videoConnection];
+            // 动态获取 Connection 投喂视频
+            [global_videoDelegate captureOutput:global_videoOutput didOutputSampleBuffer:newVideoBuffer fromConnection:DYNAMIC_VIDEO_CONN];
             CFRelease(newVideoBuffer);
         }
         if (formatDesc) CFRelease(formatDesc);
@@ -200,8 +189,8 @@ static void sendNextVirtualFrames() {
         CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, oldAudioBuffer, 1, &newAudioTiming, &newAudioBuffer);
         
         if (newAudioBuffer && global_audioDelegate && global_audioOutput) {
-            // [核心修复]：传入真实的 global_audioOutput
-            [global_audioDelegate captureOutput:global_audioOutput didOutputSampleBuffer:newAudioBuffer fromConnection:global_audioConnection];
+            // 动态获取 Connection 投喂音频
+            [global_audioDelegate captureOutput:global_audioOutput didOutputSampleBuffer:newAudioBuffer fromConnection:DYNAMIC_AUDIO_CONN];
             CFRelease(newAudioBuffer);
         }
         CFRelease(oldAudioBuffer);
@@ -223,10 +212,20 @@ static void startVirtualCameraLoop() {
         global_videoTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
         [global_assetReader addOutput:global_videoTrackOutput];
     }
+    
     if (audioTrack) {
-        global_audioTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:@{AVFormatIDKey: @(kAudioFormatLinearPCM)}];
+        // [极其关键的音频格式修复]：强制输出 16位整型、非浮点、交错的 PCM 数据，完美复刻 iPhone 麦克风硬件格式！
+        NSDictionary *audioSettings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVLinearPCMBitDepthKey: @(16),
+            AVLinearPCMIsFloatKey: @NO,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO
+        };
+        global_audioTrackOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:audioSettings];
         [global_assetReader addOutput:global_audioTrackOutput];
     }
+    
     [global_assetReader startReading];
     isPlaying = YES;
     
@@ -239,7 +238,6 @@ static void startVirtualCameraLoop() {
         dispatch_resume(global_frameTimer);
     }
 }
-
 
 // ==========================================
 // 4. API 拦截网
@@ -257,7 +255,6 @@ static void startVirtualCameraLoop() {
     if (sampleBufferDelegate) {
         global_videoDelegate = sampleBufferDelegate;
         global_videoQueue = sampleBufferCallbackQueue;
-        // [核心修复]：捕获真实的 Output 对象
         global_videoOutput = self; 
     }
     %orig(nil, nil); 
@@ -269,7 +266,6 @@ static void startVirtualCameraLoop() {
     if (sampleBufferDelegate) {
         global_audioDelegate = sampleBufferDelegate;
         global_audioQueue = sampleBufferCallbackQueue;
-        // [核心修复]：捕获真实的 Output 对象
         global_audioOutput = self; 
     }
     %orig(nil, nil); 
@@ -279,14 +275,6 @@ static void startVirtualCameraLoop() {
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
-    for (AVCaptureOutput *output in self.outputs) {
-        if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
-            global_videoConnection = [output connectionWithMediaType:AVMediaTypeVideo];
-        } else if ([output isKindOfClass:[AVCaptureAudioDataOutput class]]) {
-            global_audioConnection = [output connectionWithMediaType:AVMediaTypeAudio];
-        }
-    }
-    
     global_timeOffset = kCMTimeInvalid;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         startVirtualCameraLoop();
