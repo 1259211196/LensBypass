@@ -1,6 +1,5 @@
 name: Build LensBypass
 
-# 触发条件：当你 push 代码到 main 目录，或者在 GitHub 网页上手动点击运行时触发
 on:
   push:
     branches: [ "main", "master" ]
@@ -9,10 +8,8 @@ on:
 jobs:
   build:
     name: Build Tweak
-    # 使用苹果 macOS 虚拟机，因为编译 iOS 底层库依赖 Xcode 环境最稳妥
     runs-on: macos-latest
     
-    # 设置 Theos 环境变量路径
     env:
       THEOS: ${{ github.workspace }}/theos
 
@@ -30,18 +27,17 @@ jobs:
 
       - name: 下载 iOS 编译 SDK (Setup iOS SDKs)
         run: |
+          rm -rf $THEOS/sdks
           git clone https://github.com/theos/sdks.git $THEOS/sdks
 
       - name: 开始核心编译 (Build Tweak)
         run: |
-          # 开启 FINALPACKAGE=1 会生成 Release 版本，体积更小，并去掉调试符号
           make package FINALPACKAGE=1
 
       - name: 提取并上传 Dylib 成品 (Upload Dylib)
         uses: actions/upload-artifact@v4
         with:
           name: LensBypass-Dylib
-          # 编译完成后，真正的胖格式 (arm64+arm64e) dylib 会生成在隐藏目录 .theos/obj 下
           path: .theos/obj/*.dylib
           
       - name: 提取并上传 DEB 安装包 (Upload DEB)
