@@ -25,12 +25,11 @@ static CMTime global_timeOffset = {0, 0, 0, 0};
 static BOOL isPlaying = NO;
 
 // ==========================================
-// 2. 悬浮窗与相册控制器
+// 2. 潜行模式：隐形手势与相册控制器 (无UI注入版)
 // ==========================================
 @interface LensBypassUIManager : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, strong) UIButton *floatingButton;
 + (instancetype)sharedInstance;
-- (void)setupFloatingButtonInWindow:(UIWindow *)window;
+- (void)setupHiddenGestureInWindow:(UIWindow *)window;
 @end
 
 @implementation LensBypassUIManager
@@ -40,28 +39,33 @@ static BOOL isPlaying = NO;
     dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
     return instance;
 }
-- (void)setupFloatingButtonInWindow:(UIWindow *)window {
-    if (self.floatingButton) return;
-    self.floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.floatingButton.frame = CGRectMake(20, 100, 60, 60);
-    self.floatingButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
-    self.floatingButton.layer.cornerRadius = 30;
-    [self.floatingButton setTitle:@"选片" forState:UIControlStateNormal];
-    [self.floatingButton addTarget:self action:@selector(openAlbum) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [self.floatingButton addGestureRecognizer:pan];
-    [window addSubview:self.floatingButton];
+
+// 挂载隐形手势，代替悬浮窗
+- (void)setupHiddenGestureInWindow:(UIWindow *)window {
+    // 防止重复添加
+    for (UIGestureRecognizer *gesture in window.gestureRecognizers) {
+        if ([gesture.accessibilityLabel isEqualToString:@"LensBypassGesture"]) {
+            return; 
+        }
+    }
+    
+    // 设置暗号：双指三击 (两个手指同时连续点3下屏幕)
+    UITapGestureRecognizer *secretTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openAlbum)];
+    secretTap.numberOfTouchesRequired = 2; // 需要两个手指
+    secretTap.numberOfTapsRequired = 3;    // 需要点击三次
+    secretTap.accessibilityLabel = @"LensBypassGesture"; // 打个内部标记防重复
+    
+    [window addGestureRecognizer:secretTap];
+    NSLog(@"[LensBypass] 隐形手势注入成功，暗号：双指三击");
 }
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint point = [pan translationInView:self.floatingButton.superview];
-    self.floatingButton.center = CGPointMake(self.floatingButton.center.x + point.x, self.floatingButton.center.y + point.y);
-    [pan setTranslation:CGPointZero inView:self.floatingButton.superview];
-}
+
 - (UIViewController *)topViewController {
     UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
     while (topController.presentedViewController) { topController = topController.presentedViewController; }
     return topController;
 }
+
+// 手势触发后直接弹出相册
 - (void)openAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.delegate = self;
@@ -69,6 +73,7 @@ static BOOL isPlaying = NO;
     picker.mediaTypes = @[(NSString *)kUTTypeMovie, (NSString *)kUTTypeVideo]; 
     [[self topViewController] presentViewController:picker animated:YES completion:nil];
 }
+
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
     NSURL *videoURL = info[UIImagePickerControllerMediaURL];
@@ -81,15 +86,14 @@ static BOOL isPlaying = NO;
         [fm copyItemAtPath:videoURL.path toPath:destPath error:&error];
         if (!error) {
             dynamicVideoPath = destPath;
-            [self.floatingButton setTitle:@"已载" forState:UIControlStateNormal];
-            self.floatingButton.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.7];
-            
-            // 如果更换了视频，强制重置状态
+            // 每次重新选片，重置底层时间锚点，准备开工
             global_timeOffset = kCMTimeInvalid;
             isPlaying = NO;
+            NSLog(@"[LensBypass] 视频已就绪，潜行等待中...");
         }
     }
 }
+
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
@@ -253,7 +257,8 @@ static void startVirtualCameraLoop() {
 %hook UIWindow
 - (void)makeKeyAndVisible {
     %orig;
-    [[LensBypassUIManager sharedInstance] setupFloatingButtonInWindow:self];
+    // 调用新的手势注入方法
+    [[LensBypassUIManager sharedInstance] setupHiddenGestureInWindow:self];
 }
 %end
 
